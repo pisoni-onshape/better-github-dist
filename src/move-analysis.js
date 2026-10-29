@@ -12,7 +12,7 @@
  * better-github.user.js resolves this module as an optional dependency and
  * wires it up through initialize()/runForCurrentPage(), passing in small
  * callbacks (getPullRequestInfo, getFilePathFromRegion, isFilesChangedView,
- * autoLoadLargeFileDiffs, isEnabled) rather than duplicating that general PR
+ * autoLoadLargeFileDiffs, isEnabled, shouldAutoRun) rather than duplicating that general PR
  * parsing / settings logic here.
  */
 
@@ -38,6 +38,9 @@
     const MOVE_NAVIGATION_POLL_MS = 100;
 
     let moveAnalysisState = null;
+    const moveAnalysisStates = new Map();
+    const revisionDataCache = new WeakMap();
+    const missingRevisionWarnings = new Set();
     let movesStylesInjected = false;
 
     // Callbacks supplied by better-github.user.js through initialize(). Kept
@@ -48,7 +51,8 @@
         getFilePathFromRegion: () => null,
         isFilesChangedView: () => false,
         autoLoadLargeFileDiffs: () => {},
-        isEnabled: () => false
+        isEnabled: () => false,
+        shouldAutoRun: () => false
     };
 
     function decodeGitQuotedPath(pathText) {
@@ -690,6 +694,49 @@
         return `${pullRequestInfo.owner}/${pullRequestInfo.repository}#${pullRequestInfo.pullRequestNumber}`;
     }
 
+    function getMoveAnalysisRevision(pullRequestInfo) {
+        const pullRequestPath = new URL(pullRequestInfo.baseUrl).pathname;
+        const scripts = document.querySelectorAll('react-app script[data-target="react-app.embeddedData"]');
+        for (const script of scripts) {
+            const initialPath = (script.closest('react-app').getAttribute('initial-path') || '').split('?')[0];
+            if (initialPath && initialPath !== pullRequestPath && !initialPath.startsWith(`${pullRequestPath}/`)) {
+                continue;
+            }
+
+            const text = script.textContent;
+            let cached = revisionDataCache.get(script);
+            if (!cached || cached.text !== text) {
+                let revision = null;
+                try {
+                    const payload = JSON.parse(text).payload;
+                    const pullRequest = payload?.pullRequest;
+                    const diff = payload?.diffEntryData;
+                    const head = diff?.headOid || diff?.headSha || pullRequest?.headRefOid;
+                    const base = diff?.baseOid || diff?.baseSha || pullRequest?.baseRefOid;
+                    if (head) {
+                        revision = `${base || ''}:${head}`;
+                    }
+                } catch (error) {
+                    console.error('Better GitHub: Could not read pull request revision data:', error);
+                }
+                cached = { text, revision };
+                revisionDataCache.set(script, cached);
+            }
+            if (cached.revision) {
+                return cached.revision;
+            }
+        }
+        return null;
+    }
+
+    function canRenderMoveAnalysis(pullRequestInfo) {
+        const currentPullRequestInfo = dependencies.getPullRequestInfo();
+        return dependencies.isEnabled()
+            && currentPullRequestInfo
+            && getMoveAnalysisKey(currentPullRequestInfo) === getMoveAnalysisKey(pullRequestInfo)
+            && dependencies.isFilesChangedView(currentPullRequestInfo);
+    }
+
     function requestText(url) {
         return new Promise((resolve, reject) => {
             if (typeof GM === 'undefined' || typeof GM.xmlHttpRequest !== 'function') {
@@ -776,6 +823,10 @@
     }
 
     function updateMoveAnalysisControls(pullRequestInfo) {
+        if (!canRenderMoveAnalysis(pullRequestInfo)) {
+            return;
+        }
+
         const controls = getMoveAnalysisControls();
         if (!controls) {
             return;
@@ -1071,7 +1122,8 @@
     }
 
     function renderMoveAnalysisResults(pullRequestInfo) {
-        if (!moveAnalysisState
+        if (!canRenderMoveAnalysis(pullRequestInfo)
+            || !moveAnalysisState
             || moveAnalysisState.key !== getMoveAnalysisKey(pullRequestInfo)
             || !moveAnalysisState.result) {
             return;
@@ -1101,10 +1153,16 @@
         updateMoveAnalysisControls(pullRequestInfo);
     }
 
-    async function runMoveAnalysis(pullRequestInfo) {
+    async function runMoveAnalysis(pullRequestInfo, revision) {
+        if (!canRenderMoveAnalysis(pullRequestInfo)) {
+            return;
+        }
+
         const key = getMoveAnalysisKey(pullRequestInfo);
+        revision = revision || getMoveAnalysisRevision(pullRequestInfo) || moveAnalysisStates.get(key)?.revision || null;
         if (moveAnalysisState
             && moveAnalysisState.key === key
+            && moveAnalysisState.revision === revision
             && ['loading', 'fetching', 'analyzing'].includes(moveAnalysisState.phase)) {
             return;
         }
@@ -1112,19 +1170,21 @@
         clearMoveAnnotations();
         const analysisState = {
             key,
+            revision,
             phase: 'loading',
             result: null,
-            partial: false,
+            partial: detectPartialMoveAnalysis(),
             forceLoadUntil: Date.now() + MOVE_FORCE_LOAD_WINDOW_MS,
             unavailableEndpointCount: 0
         };
         moveAnalysisState = analysisState;
+        moveAnalysisStates.set(key, analysisState);
         updateMoveAnalysisControls(pullRequestInfo);
-        dependencies.autoLoadLargeFileDiffs(true);
 
         try {
+            dependencies.autoLoadLargeFileDiffs(true);
             await new Promise(resolve => requestAnimationFrame(resolve));
-            if (moveAnalysisState !== analysisState) {
+            if (moveAnalysisStates.get(key) !== analysisState) {
                 return;
             }
             analysisState.phase = 'fetching';
@@ -1134,42 +1194,39 @@
                 throw new Error('GitHub did not return a recognizable pull request diff');
             }
 
-            if (moveAnalysisState !== analysisState) {
+            if (moveAnalysisStates.get(key) !== analysisState) {
                 return;
             }
             analysisState.phase = 'analyzing';
             updateMoveAnalysisControls(pullRequestInfo);
             await new Promise(resolve => setTimeout(resolve, 0));
             const result = analyzeMovedRanges(diffText);
-            if (moveAnalysisState !== analysisState) {
+            if (moveAnalysisStates.get(key) !== analysisState) {
                 return;
             }
             analysisState.result = result;
-            analysisState.partial = detectPartialMoveAnalysis();
+            if (canRenderMoveAnalysis(pullRequestInfo)) {
+                analysisState.partial = detectPartialMoveAnalysis();
+            }
             analysisState.forceLoadUntil = Date.now() + MOVE_FORCE_LOAD_WINDOW_MS;
             analysisState.phase = 'complete';
-            renderMoveAnalysisResults(pullRequestInfo);
+            if (moveAnalysisState === analysisState) {
+                renderMoveAnalysisResults(pullRequestInfo);
+            }
         } catch (error) {
-            if (moveAnalysisState !== analysisState) {
+            if (moveAnalysisStates.get(key) !== analysisState) {
                 return;
             }
             console.error('Better GitHub move analysis failed:', error);
             analysisState.phase = 'error';
             analysisState.message = error.message || 'Move analysis failed';
-            updateMoveAnalysisControls(pullRequestInfo);
+            if (moveAnalysisState === analysisState && canRenderMoveAnalysis(pullRequestInfo)) {
+                updateMoveAnalysisControls(pullRequestInfo);
+            }
         }
     }
 
     function addMoveAnalysisButton(pullRequestInfo) {
-        if (!dependencies.isEnabled()) {
-            const controls = getMoveAnalysisControls();
-            if (controls) {
-                controls.remove();
-            }
-            clearMoveAnnotations();
-            return;
-        }
-
         let controls = getMoveAnalysisControls();
         if (!controls) {
             controls = document.createElement('span');
@@ -1218,9 +1275,8 @@
 
     // Called on every run of the main script's runFeaturesForCurrentPage, for
     // every pull request page (not only Files changed) so that state can be
-    // reset on PR navigation. Controls/annotations are only shown on the
-    // Files changed view, but a completed result for the same PR is kept so
-    // returning to that view re-renders without another fetch.
+    // restored on PR navigation. Keep failures as well as results to avoid
+    // automatically retrying on every mutation or tab change.
     function runForCurrentPage(pullRequestInfo) {
         if (moveAnalysisState
             && (!pullRequestInfo || moveAnalysisState.key !== getMoveAnalysisKey(pullRequestInfo))) {
@@ -1228,9 +1284,34 @@
             moveAnalysisState = null;
         }
 
+        if (!dependencies.isEnabled()) {
+            moveAnalysisState = null;
+            moveAnalysisStates.clear();
+            removeMoveAnalysisButton();
+            return;
+        }
+
         if (!pullRequestInfo || !dependencies.isFilesChangedView(pullRequestInfo)) {
             removeMoveAnalysisButton();
             return;
+        }
+
+        const key = getMoveAnalysisKey(pullRequestInfo);
+        const cachedState = moveAnalysisStates.get(key);
+        const revision = getMoveAnalysisRevision(pullRequestInfo) || cachedState?.revision || null;
+        const nextState = cachedState && cachedState.revision === revision ? cachedState : null;
+        if (moveAnalysisState !== nextState) {
+            clearMoveAnnotations();
+            moveAnalysisState = nextState;
+        }
+
+        addMoveAnalysisButton(pullRequestInfo);
+        if (dependencies.shouldAutoRun() && !moveAnalysisState && getMoveAnalysisControls()) {
+            if (!revision && !missingRevisionWarnings.has(key)) {
+                missingRevisionWarnings.add(key);
+                console.warn('Better GitHub: Pull request revision metadata is unavailable. Automatic move analysis will run once for this PR in this page session; use Re-analyze moves after updates.');
+            }
+            runMoveAnalysis(pullRequestInfo, revision);
         }
 
         const forceLoadForMoveAnalysis = Boolean(
@@ -1238,7 +1319,6 @@
             && moveAnalysisState.key === getMoveAnalysisKey(pullRequestInfo)
             && Date.now() < moveAnalysisState.forceLoadUntil
         );
-        addMoveAnalysisButton(pullRequestInfo);
         if (forceLoadForMoveAnalysis) {
             dependencies.autoLoadLargeFileDiffs(true);
         }
