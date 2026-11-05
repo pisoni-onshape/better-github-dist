@@ -36,12 +36,21 @@
     const MOVE_FORCE_LOAD_WINDOW_MS = 15000;
     const MOVE_NAVIGATION_WAIT_MS = 5000;
     const MOVE_NAVIGATION_POLL_MS = 100;
+    const MOVE_FOCUS_DURATION_MS = 1600;
+    const MOVE_FOCUS_CLASSES = [
+        'better-github-move-focus',
+        'better-github-move-focus-top',
+        'better-github-move-focus-bottom',
+        'better-github-move-focus-left',
+        'better-github-move-focus-right'
+    ];
 
     let moveAnalysisState = null;
     const moveAnalysisStates = new Map();
     const revisionDataCache = new WeakMap();
     const missingRevisionWarnings = new Set();
     let movesStylesInjected = false;
+    let moveFocusTimeoutId = null;
 
     // Callbacks supplied by better-github.user.js through initialize(). Kept
     // as narrow, explicit dependencies instead of reaching into the main
@@ -643,18 +652,22 @@
                 color: var(--fgColor-attention, var(--color-attention-fg, #9a6700));
             }
             .better-github-moved-source {
+                --better-github-move-bar: inset 4px 0 0 #8250df;
                 background-color: rgba(163, 113, 247, 0.14) !important;
-                box-shadow: inset 4px 0 0 #8250df;
+                box-shadow: var(--better-github-move-bar);
             }
             .better-github-moved-destination {
+                --better-github-move-bar: inset 4px 0 0 #1b7c83;
                 background-color: rgba(57, 197, 207, 0.14) !important;
-                box-shadow: inset 4px 0 0 #1b7c83;
+                box-shadow: var(--better-github-move-bar);
             }
             .better-github-moved-edited-source {
-                box-shadow: inset 4px 0 0 rgba(130, 80, 223, 0.7);
+                --better-github-move-bar: inset 4px 0 0 rgba(130, 80, 223, 0.7);
+                box-shadow: var(--better-github-move-bar);
             }
             .better-github-moved-edited-destination {
-                box-shadow: inset 4px 0 0 rgba(27, 124, 131, 0.7);
+                --better-github-move-bar: inset 4px 0 0 rgba(27, 124, 131, 0.7);
+                box-shadow: var(--better-github-move-bar);
             }
             .better-github-move-annotation {
                 align-items: center;
@@ -680,12 +693,38 @@
                 text-align: left;
                 text-decoration: underline;
             }
+            /* Focus flash for a navigated range: a fading accent tint over the
+               whole range plus a thin border on its outer edges only. Inset
+               shadows paint above the !important move background color, and
+               the per-edge widths keep inner cell boundaries borderless. */
             .better-github-move-focus {
-                animation: better-github-move-focus 1.6s ease-out;
+                --better-github-move-focus-color: var(--borderColor-accent-emphasis, #0969da);
+                --better-github-move-focus-tint: rgba(84, 174, 255, 0.28);
+                animation: better-github-move-focus ${MOVE_FOCUS_DURATION_MS}ms ease-out forwards;
             }
+            .better-github-move-focus-top { --better-github-move-focus-top: 1px; }
+            .better-github-move-focus-bottom { --better-github-move-focus-bottom: -1px; }
+            .better-github-move-focus-left { --better-github-move-focus-left: 1px; }
+            .better-github-move-focus-right { --better-github-move-focus-right: -1px; }
             @keyframes better-github-move-focus {
-                0%, 35% { outline: 2px solid var(--borderColor-accent-emphasis, #0969da); outline-offset: -2px; }
-                100% { outline-color: transparent; }
+                0%, 35% {
+                    box-shadow:
+                        inset 0 var(--better-github-move-focus-top, 0px) 0 0 var(--better-github-move-focus-color),
+                        inset 0 var(--better-github-move-focus-bottom, 0px) 0 0 var(--better-github-move-focus-color),
+                        inset var(--better-github-move-focus-left, 0px) 0 0 0 var(--better-github-move-focus-color),
+                        inset var(--better-github-move-focus-right, 0px) 0 0 0 var(--better-github-move-focus-color),
+                        var(--better-github-move-bar, inset 0 0 0 0 transparent),
+                        inset 0 0 0 9999px var(--better-github-move-focus-tint);
+                }
+                100% {
+                    box-shadow:
+                        inset 0 var(--better-github-move-focus-top, 0px) 0 0 transparent,
+                        inset 0 var(--better-github-move-focus-bottom, 0px) 0 0 transparent,
+                        inset var(--better-github-move-focus-left, 0px) 0 0 0 transparent,
+                        inset var(--better-github-move-focus-right, 0px) 0 0 0 transparent,
+                        var(--better-github-move-bar, inset 0 0 0 0 transparent),
+                        inset 0 0 0 9999px transparent;
+                }
             }
         `);
     }
@@ -799,21 +838,28 @@
         return pageIndicatesLimitedDiff();
     }
 
+    function clearMoveFocus() {
+        clearTimeout(moveFocusTimeoutId);
+        moveFocusTimeoutId = null;
+        document.querySelectorAll('.better-github-move-focus').forEach(element => {
+            element.classList.remove(...MOVE_FOCUS_CLASSES);
+        });
+    }
+
     function clearMoveAnnotations() {
         document.querySelectorAll('[data-better-github="move-annotation"]').forEach(annotation => annotation.remove());
+        clearMoveFocus();
         document.querySelectorAll([
             '.better-github-moved-source',
             '.better-github-moved-destination',
             '.better-github-moved-edited-source',
-            '.better-github-moved-edited-destination',
-            '.better-github-move-focus'
+            '.better-github-moved-edited-destination'
         ].join(',')).forEach(element => {
             element.classList.remove(
                 'better-github-moved-source',
                 'better-github-moved-destination',
                 'better-github-moved-edited-source',
-                'better-github-moved-edited-destination',
-                'better-github-move-focus'
+                'better-github-moved-edited-destination'
             );
         });
     }
@@ -1030,23 +1076,32 @@
         }
 
         const targetRegion = findMoveDiffRegion(targetSide.path, analysisState.result.parsedDiff);
-        const focusedCells = [];
+        const focusedRows = [];
         for (let lineNumber = targetSide.startLine; lineNumber <= targetSide.endLine; lineNumber += 1) {
             const row = targetRegion && findMoveDiffRowInRegion(targetRegion, diffSide, lineNumber);
             if (row) {
-                getMoveSideCells(row, diffSide).forEach(cell => {
-                    cell.classList.add('better-github-move-focus');
-                    focusedCells.push(cell);
-                });
+                const cells = getMoveSideCells(row, diffSide).sort((first, second) => (
+                    first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
+                ));
+                focusedRows.push(cells);
             }
         }
 
-        targetRow.scrollIntoView({ block: 'center' });
-        setTimeout(() => {
-            focusedCells.forEach(element => {
-                element.classList.remove('better-github-move-focus');
+        clearMoveFocus();
+        // Flush styles so re-focusing the same cells restarts the animation.
+        void document.body.offsetWidth;
+        focusedRows.forEach((cells, rowIndex) => {
+            cells.forEach((cell, cellIndex) => {
+                cell.classList.add('better-github-move-focus');
+                cell.classList.toggle('better-github-move-focus-top', rowIndex === 0);
+                cell.classList.toggle('better-github-move-focus-bottom', rowIndex === focusedRows.length - 1);
+                cell.classList.toggle('better-github-move-focus-left', cellIndex === 0);
+                cell.classList.toggle('better-github-move-focus-right', cellIndex === cells.length - 1);
             });
-        }, 1700);
+        });
+
+        targetRow.scrollIntoView({ block: 'center' });
+        moveFocusTimeoutId = setTimeout(clearMoveFocus, MOVE_FOCUS_DURATION_MS + 100);
     }
 
     function addMoveAnnotation(row, range, sideName, pullRequestInfo) {
